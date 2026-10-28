@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: python -m pip install build
+
+      - run: python -m build --wheel
+
+      - name: Attach the wheel to a GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          wheel=$(ls dist/*-py3-none-any.whl)
+          case "$wheel" in
+            *-"${GITHUB_REF_NAME#v}"-py3-none-any.whl) ;;
+            *) echo "Tag $GITHUB_REF_NAME does not match $wheel" >&2; exit 1 ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "$wheel" --verify-tag --generate-notes
+
+      - name: Print the plugin catalog entry
+        run: |
+          sha256=$(sha256sum dist/*-py3-none-any.whl | cut -d " " -f 1)
+          {
+            echo "To list this release in the DataLab plugin catalog, add"
+            echo "\`plugins/org.datalab.dynamic-demo.yaml\` to"
+            echo "https://github.com/DataLab-Platform/plugins"
+            echo "(or only the new release if the plugin is already listed):"
+            echo
+            echo '```yaml'
+            cat <<'EOF'
+          id: org.datalab.dynamic-demo
+          name: "Dynamic mode demo"
+          EOF
+            echo "repository: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            echo "capabilities: [application]"
+            echo "releases:"
+            echo "  - version: ${GITHUB_REF_NAME#v}"
+            echo "    sha256: $sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
