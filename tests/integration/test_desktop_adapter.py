@@ -2,6 +2,7 @@
 
 from datalab.plugins import PluginCapability
 
+from datalab_dynamic_demo import __version__
 from datalab_dynamic_demo.adapters import desktop
 
 
@@ -9,7 +10,7 @@ def test_plugin_descriptor() -> None:
     """The generated entry point exposes stable SDK metadata."""
     plugin_class = desktop.DynamicModeDemoPlugin
     assert plugin_class.get_plugin_id() == "org.datalab.dynamic-demo"
-    assert plugin_class.PLUGIN_INFO.version == "0.1.0"
+    assert plugin_class.PLUGIN_INFO.version == __version__
     assert plugin_class.PLUGIN_INFO.capabilities == frozenset(
         {
             PluginCapability.APPLICATION,
