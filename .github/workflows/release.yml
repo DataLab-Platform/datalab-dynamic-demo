@@ -1,55 +1,180 @@
+# ============================================================================
+# Prepare and publish a release of the Dynamic mode demo DataLab plugin
+# (procedure: RELEASING.md).
+#
+# Maintainers never create a GitHub release by hand. A release takes two
+# steps, each one running this workflow, which relies on the release actions
+# shared by the DataLab Platform projects
+# (https://github.com/DataLab-Platform/release-actions):
+#
+# 1. "Prepare vX.Y.Z" - a maintainer pushes a release tag:
+#      vX.Y.Z      final release, on `main`, __version__ = "X.Y.Z"
+#      vX.Y.Z-rcN  release candidate, on any branch, __version__ = "X.Y.ZrcN"
+#    The tag is checked (format, version, CHANGELOG.md section, release
+#    branch, no release already published), the tests run, the wheel is
+#    built, and a DRAFT GitHub release is created with the wheel, SHA256SUMS
+#    and its build provenance attestation. Nothing is published yet: on
+#    failure, delete the tag, fix and tag again.
+#
+# 2. "Publish vX.Y.Z" - a maintainer reviews the draft release and publishes
+#    it. The wheel of the release is checked against SHA256SUMS and its
+#    attestation, and the summary of the run gives the entry of the DataLab
+#    plugin catalog (https://github.com/DataLab-Platform/plugins), with the
+#    SHA-256 digest of the checked wheel.
+# ============================================================================
 name: Release
+
+run-name: >-
+  ${{ github.event_name == 'release' && 'Publish' || 'Prepare' }}
+  ${{ github.ref_name }}
 
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  release:
+    types: [published]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  INIT_FILE: src/datalab_dynamic_demo/__init__.py
+  NOTES_FILE: CHANGELOG.md
+  NOTES_HEADING: "## [{version}]"
 
 jobs:
-  release:
+  # ---------------------------------------------------------------------------
+  # Step 1 - Prepare: check the tag before spending time on tests and builds.
+  # ---------------------------------------------------------------------------
+  check-tag:
+    name: Check the tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: tag
+        uses: DataLab-Platform/release-actions/check-tag@v1
+        with:
+          version-file: ${{ env.INIT_FILE }}
+          notes-file: ${{ env.NOTES_FILE }}
+          notes-heading: ${{ env.NOTES_HEADING }}
+
+  tests:
+    needs: check-tag
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build the wheel
+    needs: [check-tag, tests]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
-      - run: python -m pip install build
-
-      - run: python -m build --wheel
-
-      - name: Attach the wheel to a GitHub release
+      - name: Build the wheel
         env:
-          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-tag.outputs.version }}
         run: |
-          wheel=$(ls dist/*-py3-none-any.whl)
-          case "$wheel" in
-            *-"${GITHUB_REF_NAME#v}"-py3-none-any.whl) ;;
-            *) echo "Tag $GITHUB_REF_NAME does not match $wheel" >&2; exit 1 ;;
-          esac
-          gh release create "$GITHUB_REF_NAME" "$wheel" --verify-tag --generate-notes
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          # check-tag checked __version__; the wheel version comes from
+          # pyproject.toml, which must match too.
+          if [ ! -f "dist/datalab_dynamic_demo-$VERSION-py3-none-any.whl" ]; then
+            echo "::error::Expected dist/datalab_dynamic_demo-$VERSION-py3-none-any.whl (version of pyproject.toml?), found: $(ls dist)"
+            exit 1
+          fi
 
-      - name: Print the plugin catalog entry
-        run: |
-          sha256=$(sha256sum dist/*-py3-none-any.whl | cut -d " " -f 1)
-          {
-            echo "To list this release in the DataLab plugin catalog, add"
-            echo "\`plugins/org.datalab.dynamic-demo.yaml\` to"
-            echo "https://github.com/DataLab-Platform/plugins"
-            echo "(or only the new release if the plugin is already listed):"
-            echo
-            echo '```yaml'
-            cat <<'EOF'
-          id: org.datalab.dynamic-demo
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheel
+          path: dist/*.whl
+          retention-days: 30
+
+  draft-release:
+    name: Create the draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the draft release
+      id-token: write       # required by the build provenance attestation
+      attestations: write   # required by the build provenance attestation
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: wheel
+          path: dist
+
+      - uses: DataLab-Platform/release-actions/create-draft@v1
+        with:
           name: "Dynamic mode demo"
+          files: dist/*.whl
+          notes-file: ${{ env.NOTES_FILE }}
+          notes-heading: ${{ env.NOTES_HEADING }}
+
+  # ---------------------------------------------------------------------------
+  # Step 2 - Publish: check the wheel of the published release, then give its
+  # plugin catalog entry.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Check the release and give the catalog entry
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read      # download the files of the release
+      attestations: read  # verify their build provenance
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: release
+        uses: DataLab-Platform/release-actions/verify-release@v1
+        with:
+          files: datalab_dynamic_demo-{version}-py3-none-any.whl
+
+      - name: Give the plugin catalog entry
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import hashlib, os, pathlib, re, urllib.error, urllib.request
+
+          init = pathlib.Path(os.environ["INIT_FILE"]).read_text(encoding="utf-8")
+          plugin_id = re.search(r'^PLUGIN_ID = "([^"]+)"', init, re.M).group(1)
+          name = re.search(r'^PLUGIN_NAME = "([^"]+)"', init, re.M).group(1)
+          version = os.environ["VERSION"]
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          sha256 = hashlib.sha256(wheel.read_bytes()).hexdigest()
+          print("## DataLab plugin catalog\n")
+          if os.environ["PRERELEASE"] == "true":
+              print(f"Release candidate {version}: not to be listed in the catalog.")
+              raise SystemExit
+          entry = f"plugins/{plugin_id}.yaml"
+          url = f"https://raw.githubusercontent.com/DataLab-Platform/plugins/main/{entry}"
+          try:
+              urllib.request.urlopen(url, timeout=30).close()
+              listed = True
+          except urllib.error.HTTPError:
+              listed = False
+          release = f"  - version: {version}\n    sha256: {sha256}"
+          catalog = "https://github.com/DataLab-Platform/plugins"
+          if listed:
+              print(f"Add this release to `{entry}` in {catalog} (pull request):\n")
+              print(f"```yaml\n{release}\n```")
+          else:
+              repository = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+              print(f"To list the plugin, add `{entry}` to {catalog} (pull request), completing its capabilities:\n")
+              print(f'```yaml\nid: {plugin_id}\nname: "{name}"\nrepository: {repository}\ncapabilities: []\nreleases:\n{release}\n```')
           EOF
-            echo "repository: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
-            echo "capabilities: [application]"
-            echo "releases:"
-            echo "  - version: ${GITHUB_REF_NAME#v}"
-            echo "    sha256: $sha256"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
