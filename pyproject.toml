@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datalab-dynamic-demo"
-version = "0.1.0"
+version = "0.1.1rc1"
 description = "Mockup of DataLab dynamic mode: live source and auto-updated processing result"
 readme = "README.md"
 license = "BSD-3-Clause"
